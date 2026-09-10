@@ -6,11 +6,9 @@ __pycache__/
 # Secrets — never commit these
 .env
 
-# Generated / local data — large, regenerable, and CUAD's license terms
+# Raw dataset — large, regenerable, and CUAD's license terms
 # are best respected by not redistributing the raw dataset via your own repo
 data/
-dev.db
-qdrant_local_data/
 
 # OS/editor cruft
 .DS_Store

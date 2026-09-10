@@ -7,15 +7,21 @@ Run with: uvicorn main:app --reload --port 8000
 Test with: curl or the /docs Swagger UI at http://localhost:8000/docs
 """
 import os
+import uuid
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct
+
+from build_index import chunk_text  # same 300-word / 50-overlap chunker
+from text_extract import extract_text
 
 load_dotenv()
 
-QDRANT_LOCAL_PATH = os.getenv("QDRANT_LOCAL_PATH", "./qdrant_local_data")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
 COLLECTION_NAME = "groundwork_chunks"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
@@ -25,7 +31,7 @@ app = FastAPI(title="Groundwork API")
 
 # Loaded once at startup, reused across requests
 embed_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-qdrant = QdrantClient(path=QDRANT_LOCAL_PATH)
+qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
 # --- LLM client setup, based on LLM_PROVIDER in .env ---
 if LLM_PROVIDER == "openai":
@@ -125,3 +131,51 @@ def query(request: QueryRequest):
         for c in chunks
     ]
     return QueryResponse(answer=answer, sources=sources)
+
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    """Extract text from an uploaded document, chunk + embed it with the
+    same chunker/model as the CUAD index, and upsert into the same
+    Qdrant collection so /query can retrieve from it immediately."""
+    data = await file.read()
+
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    try:
+        raw_text = extract_text(file.filename, data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Text extraction failed: {e}")
+
+    chunks = chunk_text(raw_text)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Document produced no chunks.")
+
+    embeddings = embed_model.encode(chunks, show_progress_bar=False)
+
+    points = [
+        PointStruct(
+            id=str(uuid.uuid4()),  # UUID ids: never collide with CUAD's integer ids
+            vector=vector.tolist(),
+            payload={
+                "contract_id": None,
+                "filename": file.filename,
+                "document_name": file.filename,
+                "chunk_index": i,
+                "text": chunk,
+                "source": "upload",  # distinguishes uploads from CUAD contracts
+            },
+        )
+        for i, (chunk, vector) in enumerate(zip(chunks, embeddings))
+    ]
+
+    qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+
+    return {
+        "filename": file.filename,
+        "chunks_indexed": len(chunks),
+        "message": f"Indexed {len(chunks)} chunks from {file.filename}. You can now ask questions about it.",
+    }

@@ -15,7 +15,7 @@ from init_db import Contract, Clause, Base
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://groundwork:groundwork2026@localhost:5432/groundwork_db")
 CSV_PATH = os.path.join("data", "cuad", "CUAD_v1", "master_clauses.csv")
 TXT_ROOT = os.path.join("data", "cuad", "CUAD_v1", "full_contract_txt")
 
@@ -68,10 +68,18 @@ def main():
     ]
 
     session = Session()
-    contracts_added, clauses_added, missing_txt = 0, 0, 0
+    contracts_added, clauses_added, missing_txt, skipped_dups = 0, 0, 0, 0
+    seen_filenames = set()
 
     for _, row in df.iterrows():
         filename = str(row["Filename"])
+
+        # CUAD's CSV contains a few duplicate rows — keep the first only
+        if filename in seen_filenames:
+            skipped_dups += 1
+            continue
+        seen_filenames.add(filename)
+
         base = os.path.splitext(filename)[0]
 
         txt_path = txt_index.get(base)
@@ -118,6 +126,7 @@ def main():
     print(f"\n  contracts loaded: {contracts_added}")
     print(f"  clauses loaded: {clauses_added}")
     print(f"  contracts missing a matching .txt file: {missing_txt}")
+    print(f"  duplicate CSV rows skipped: {skipped_dups}")
 
 
 if __name__ == "__main__":

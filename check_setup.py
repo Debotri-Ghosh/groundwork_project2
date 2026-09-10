@@ -1,11 +1,16 @@
 """
 Run this after setup to confirm everything is wired correctly.
-Works whether you're on Docker (Qdrant/Postgres servers) or running
-the no-Docker fallback (local embedded Qdrant + SQLite).
+Expects Docker services (Qdrant server + Postgres) started via:
+    docker compose up -d
 Usage: python check_setup.py
 """
 import os
+import sys
 from dotenv import load_dotenv
+
+# Windows consoles (cp1252) can't print ✅/❌ — force UTF-8 output
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 load_dotenv()
 
@@ -20,27 +25,20 @@ print("\n--- Groundwork Setup Check ---\n")
 # 1. Env vars loaded
 check("APP_ENV loaded", os.getenv("APP_ENV") is not None, os.getenv("APP_ENV"))
 
-# 2. Qdrant connection — tries server mode first, falls back to local embedded mode
+# 2. Qdrant connection — server mode (Docker)
 try:
     from qdrant_client import QdrantClient
 
-    qdrant_host = os.getenv("QDRANT_HOST")
-    qdrant_local_path = os.getenv("QDRANT_LOCAL_PATH")
+    qdrant_host = os.getenv("QDRANT_HOST", "localhost")
+    qdrant_port = int(os.getenv("QDRANT_PORT", 6333))
 
-    if qdrant_host:
-        client = QdrantClient(host=qdrant_host, port=int(os.getenv("QDRANT_PORT", 6333)))
-        client.get_collections()
-        check("Qdrant connection (server mode)", True)
-    elif qdrant_local_path:
-        client = QdrantClient(path=qdrant_local_path)
-        client.get_collections()
-        check("Qdrant connection (local embedded mode)", True, qdrant_local_path)
-    else:
-        check("Qdrant connection", False, "set QDRANT_HOST or QDRANT_LOCAL_PATH in .env")
+    client = QdrantClient(host=qdrant_host, port=qdrant_port)
+    client.get_collections()
+    check("Qdrant connection (server mode)", True, f"{qdrant_host}:{qdrant_port}")
 except Exception as e:
-    check("Qdrant connection", False, str(e))
+    check("Qdrant connection (server mode)", False, str(e))
 
-# 3. Database connection — Postgres or SQLite, both via DATABASE_URL
+# 3. Database connection — Postgres via DATABASE_URL
 try:
     from sqlalchemy import create_engine, text
 
@@ -77,6 +75,4 @@ else:
     check("LLM_PROVIDER set", False, "set LLM_PROVIDER in .env")
 
 print("\nIf everything above is ✅, you're ready to start Phase 2 (data ingestion + chunking).\n")
-print("Note: DATABASE_URL using sqlite:// and QDRANT_LOCAL_PATH set means you're")
-print("running in no-Docker fallback mode — switch back to the server URLs in")
-print(".env once Docker/WSL access is available. No other code changes needed.\n")
+print("Running in Docker mode: Qdrant server + Postgres via docker compose.\n")

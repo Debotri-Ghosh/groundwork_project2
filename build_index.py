@@ -1,8 +1,8 @@
 """
-Phase 4: reads contracts from the database, splits each into overlapping
-chunks, embeds them, and upserts into a local Qdrant collection.
+Phase 4: reads contracts from Postgres, splits each into overlapping
+chunks, embeds them, and upserts into the Qdrant server collection.
 
-Usage: python build_index.py
+Usage: python build_index.py 
 """
 import os
 from dotenv import load_dotenv
@@ -16,8 +16,9 @@ from init_db import Contract
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
-QDRANT_LOCAL_PATH = os.getenv("QDRANT_LOCAL_PATH", "./qdrant_local_data")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://groundwork:groundwork2026@localhost:5432/groundwork_db")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
 COLLECTION_NAME = "groundwork_chunks"
 
@@ -45,8 +46,8 @@ def main():
     model = SentenceTransformer(EMBEDDING_MODEL_NAME)
     vector_size = model.get_sentence_embedding_dimension()
 
-    print(f"Connecting to local Qdrant at {QDRANT_LOCAL_PATH}...")
-    client = QdrantClient(path=QDRANT_LOCAL_PATH)
+    print(f"Connecting to Qdrant server at {QDRANT_HOST}:{QDRANT_PORT}...")
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
     existing = [c.name for c in client.get_collections().collections]
     if COLLECTION_NAME not in existing:

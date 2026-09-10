@@ -13,7 +13,7 @@ from init_db import Contract, Clause
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://groundwork:groundwork2026@localhost:5432/groundwork_db")
 engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
 

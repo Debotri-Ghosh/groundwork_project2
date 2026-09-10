@@ -5,6 +5,12 @@ Run once. Safe to re-run (won't duplicate tables).
 Usage: python init_db.py
 """
 import os
+import sys
+
+# Windows consoles (cp1252) can't print some Unicode — force UTF-8 output
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from dotenv import load_dotenv
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, ForeignKey
@@ -13,7 +19,7 @@ from sqlalchemy.orm import declarative_base, relationship
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://groundwork:groundwork2026@localhost:5432/groundwork_db")
 engine = create_engine(DATABASE_URL)
 Base = declarative_base()
 

@@ -29,6 +29,7 @@ ollama==0.3.3
 # --- Database ---
 sqlalchemy==2.0.35
 alembic==1.13.2
+psycopg2-binary==2.9.9
 
 # --- Validation ---
 pydantic==2.9.2

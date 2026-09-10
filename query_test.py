@@ -12,7 +12,8 @@ from qdrant_client import QdrantClient
 
 load_dotenv()
 
-QDRANT_LOCAL_PATH = os.getenv("QDRANT_LOCAL_PATH", "./qdrant_local_data")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
 COLLECTION_NAME = "groundwork_chunks"
 
@@ -24,7 +25,7 @@ def main():
     print(f"Query: {query}\n")
 
     model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    client = QdrantClient(path=QDRANT_LOCAL_PATH)
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
     query_vector = model.encode(query).tolist()
 
