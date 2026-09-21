@@ -1,10 +1,11 @@
+import os
 import time
 from datetime import datetime
 
 import requests
 import streamlit as st
 
-API_URL = "http://localhost:8000"
+API_URL = os.environ.get("GROUNDWORK_API_URL", "http://localhost:8000")
 UPLOAD_TYPES = ["pdf", "docx", "txt"]
 
 QUICK_PROMPTS = {
