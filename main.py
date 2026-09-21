@@ -126,7 +126,7 @@ def query(request: QueryRequest):
             filename=c.payload["filename"],
             chunk_index=c.payload["chunk_index"],
             score=c.score,
-            text=c.payload["text"][:300],
+            text=c.payload["text"],
         )
         for c in chunks
     ]
