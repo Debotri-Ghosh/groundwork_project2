@@ -1,6 +1,10 @@
+import html
+import json
 import os
+import re
 import time
 from datetime import datetime
+from difflib import SequenceMatcher
 
 import requests
 import streamlit as st
@@ -14,6 +18,27 @@ QUICK_PROMPTS = {
     "Insurance requirements": "What insurance is a party required to maintain under the agreement?",
     "Non-compete": "Is there a non-compete restriction, and how long does it last?",
     "Payment terms": "What are the payment terms outlined in the contract?",
+}
+
+# Must match main.py's SUPPORTED_LANGUAGES (ISO 639-1 codes); "Auto-detect"
+# is a frontend-only option that main.py sees as language="auto".
+LANGUAGES = {
+    "Auto-detect": "auto",
+    "English": "en",
+    "Hindi": "hi",
+    "Bengali": "bn",
+    "Tamil": "ta",
+    "Telugu": "te",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+}
+LANGUAGE_NAMES_BY_CODE = {v: k for k, v in LANGUAGES.items()}
+
+# ISO 639-1 -> a BCP-47 tag the browser's speechSynthesis voices actually use.
+LANG_TO_BCP47 = {
+    "en": "en-US", "hi": "hi-IN", "bn": "bn-IN", "ta": "ta-IN",
+    "te": "te-IN", "es": "es-ES", "fr": "fr-FR", "de": "de-DE",
 }
 
 # ---------------- Theme presets ----------------
@@ -51,6 +76,109 @@ st.session_state.setdefault("history", [])
 st.session_state.setdefault("uploaded_files", [])
 st.session_state.setdefault("theme_name", "Midnight Violet")
 st.session_state.setdefault("density_name", "Comfortable")
+st.session_state.setdefault("token", None)
+st.session_state.setdefault("user_email", None)
+
+
+def auth_headers():
+    return {"Authorization": f"Bearer {st.session_state['token']}"}
+
+
+def render_login_screen():
+    """Blocks the rest of the app until the user signs in or signs up.
+    Mirrors the error-handling style already used for /query and /upload."""
+    st.markdown(
+        """
+        <div style="max-width:420px;margin:10vh auto 0 auto;">
+            <h1 style="font-size:2rem;font-weight:800;margin-bottom:0;">📄 Groundwork</h1>
+            <p style="color:#9aa3b5;margin-top:4px;">Sign in to access the contract assistant.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    _, center, _ = st.columns([1, 2, 1])
+    with center:
+        try:
+            health = requests.get(f"{API_URL}/health", timeout=5)
+            if health.ok:
+                st.caption("🟢 Backend is online")
+            else:
+                st.caption("🔴 Backend returned an error")
+        except requests.RequestException:
+            st.caption(f"🔴 Backend is offline — start it at {API_URL}")
+
+        login_tab, signup_tab = st.tabs(["Log in", "Sign up"])
+
+        with login_tab:
+            with st.form("login_form"):
+                email = st.text_input("Email", key="login_email")
+                password = st.text_input("Password", type="password", key="login_password")
+                submitted = st.form_submit_button("Log in", use_container_width=True, type="primary")
+            if submitted:
+                try:
+                    resp = requests.post(
+                        f"{API_URL}/auth/login",
+                        json={"email": email, "password": password},
+                        timeout=15,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    st.session_state["token"] = data["access_token"]
+                    st.session_state["user_email"] = data["email"]
+                    st.rerun()
+                except requests.exceptions.ConnectionError:
+                    st.error(f"Could not connect to the backend. Make sure it is running at {API_URL}.")
+                except requests.exceptions.Timeout:
+                    st.error("The request timed out.")
+                except requests.exceptions.HTTPError:
+                    detail = ""
+                    try:
+                        detail = resp.json().get("detail", "")
+                    except Exception:
+                        pass
+                    st.error(detail or "Login failed.")
+                except requests.RequestException as e:
+                    st.error(f"Login failed: {e}")
+
+        with signup_tab:
+            with st.form("signup_form"):
+                new_email = st.text_input("Email", key="signup_email")
+                new_password = st.text_input(
+                    "Password", type="password", key="signup_password",
+                    help="At least 8 characters.",
+                )
+                submitted_signup = st.form_submit_button("Create account", use_container_width=True)
+            if submitted_signup:
+                try:
+                    resp = requests.post(
+                        f"{API_URL}/auth/signup",
+                        json={"email": new_email, "password": new_password},
+                        timeout=15,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    st.session_state["token"] = data["access_token"]
+                    st.session_state["user_email"] = data["email"]
+                    st.rerun()
+                except requests.exceptions.ConnectionError:
+                    st.error(f"Could not connect to the backend. Make sure it is running at {API_URL}.")
+                except requests.exceptions.Timeout:
+                    st.error("The request timed out.")
+                except requests.exceptions.HTTPError:
+                    detail = ""
+                    try:
+                        detail = resp.json().get("detail", "")
+                    except Exception:
+                        pass
+                    st.error(detail or "Sign up failed.")
+                except requests.RequestException as e:
+                    st.error(f"Sign up failed: {e}")
+
+
+if not st.session_state["token"]:
+    render_login_screen()
+    st.stop()
 
 
 def confidence_tier(score, palette):
@@ -61,20 +189,247 @@ def confidence_tier(score, palette):
     return "Low confidence", palette["bad"]
 
 
-def run_query(question: str, top_k: int):
+# ---------------- Excerpt point-splitting & citation highlighting ----------------
+# Display-only heuristics — never touch the raw grounding text itself, just
+# how it's segmented and annotated in the UI.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(])")
+_BARE_MARKER_RE = re.compile(r"^[\d/.\s]+$")
+_QUOTE_RE = re.compile(r"[“\"]([^”\"]{15,400})[”\"]")
+
+
+def split_into_points(text: str) -> list:
+    """Break a raw contract excerpt into readable points on sentence
+    boundaries, folding bare clause numbers/dates (e.g. "16.",
+    "2/8/2017 16.") forward into the sentence that follows them instead of
+    emitting them as their own stray point."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    raw_parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text) if p.strip()]
+    merged, buffer = [], ""
+    for part in raw_parts:
+        buffer = f"{buffer} {part}".strip() if buffer else part
+        if _BARE_MARKER_RE.match(buffer) or len(buffer) < 16:
+            continue
+        merged.append(buffer)
+        buffer = ""
+    if buffer:
+        merged.append(buffer)
+    return merged or [text]
+
+
+def extract_quotes(answer: str) -> list:
+    """Pull the quoted spans the LLM cited in its bulleted answer, so we can
+    point back to exactly where in the source they came from."""
+    return [q.strip() for q in _QUOTE_RE.findall(answer or "") if len(q.strip()) > 14]
+
+
+def _normalize(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def point_is_cited(point: str, quotes: list) -> bool:
+    """Whether this excerpt point is (closely) the text the answer quoted."""
+    np = _normalize(point)
+    if not np:
+        return False
+    for q in quotes:
+        nq = _normalize(q)
+        if not nq:
+            continue
+        if nq in np or np in nq:
+            return True
+        if SequenceMatcher(None, nq[:120], np[:120]).ratio() > 0.72:
+            return True
+    return False
+
+
+def highlight_html(escaped_text: str, term: str, bg_color: str) -> str:
+    """Wrap case-insensitive matches of `term` in <mark>. Expects text that's
+    already HTML-escaped, and only ever adds markup, never raw user text."""
+    if not term:
+        return escaped_text
+    pattern = re.compile(re.escape(html.escape(term)), re.IGNORECASE)
+    return pattern.sub(
+        lambda m: f"<mark style='background:{bg_color};color:#111;border-radius:3px;padding:0 2px;'>{m.group(0)}</mark>",
+        escaped_text,
+    )
+
+
+_WORD_RE = re.compile(r"[A-Za-z]{4,}")
+_OVERLAP_STOPWORDS = {
+    "this", "that", "these", "those", "with", "from", "shall", "will",
+    "under", "which", "where", "when", "what", "there", "their", "about",
+    "into", "such", "than", "then", "have", "been", "were", "does", "each",
+    "between", "agreement", "party", "parties", "excerpts", "excerpt",
+}
+
+
+def extract_overlap_terms(*texts: str) -> set:
+    """Words (4+ letters) shared between the question/answer and an excerpt,
+    minus common filler — used to bold what's actually relevant at a glance,
+    distinct from point_is_cited's whole-sentence citation match."""
+    words = set()
+    for t in texts:
+        for w in _WORD_RE.findall(t or ""):
+            wl = w.lower()
+            if wl not in _OVERLAP_STOPWORDS:
+                words.add(wl)
+    return words
+
+
+def bold_overlap_html(escaped_text: str, terms: set) -> str:
+    """Bold occurrences of any term in `terms` within already-escaped text."""
+    if not terms:
+        return escaped_text
+    pattern = re.compile(r"\b(" + "|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True)) + r")\b", re.IGNORECASE)
+    return pattern.sub(lambda m: f"<b>{m.group(0)}</b>", escaped_text)
+
+
+# ---------------- Read-aloud (Phase C) ----------------
+def strip_markdown_for_speech(text: str) -> str:
+    """Remove Markdown syntax (bold/italic/headers/bullets/blockquotes/code)
+    so the browser's TTS reads words, not punctuation. Does not touch the
+    displayed answer — only the copy sent to speechSynthesis."""
+    t = text or ""
+    t = re.sub(r"```.*?```", " ", t, flags=re.DOTALL)
+    t = re.sub(r"`([^`]*)`", r"\1", t)
+    t = re.sub(r"\*\*([^*]+)\*\*", r"\1", t)
+    t = re.sub(r"\*([^*]+)\*", r"\1", t)
+    t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.MULTILINE)
+    t = re.sub(r"^\s*[-*•]\s+", "", t, flags=re.MULTILINE)
+    t = re.sub(r"^\s*>\s*", "", t, flags=re.MULTILINE)
+    t = re.sub(r"\n{2,}", ". ", t)
+    t = re.sub(r"\n", " ", t)
+    return re.sub(r"\s{2,}", " ", t).strip()
+
+
+def render_listen_widget(uid: str, text: str, lang_code: str, palette: dict):
+    """A self-contained Listen/Pause/Stop + speed control using only the
+    browser's built-in Web Speech API — no backend call, no API key."""
+    clean_text = strip_markdown_for_speech(text)
+    if not clean_text:
+        return
+    bcp47 = LANG_TO_BCP47.get(lang_code or "en", "en-US")
+    text_json = json.dumps(clean_text).replace("</script>", "<\\/script>")
+    btn_style = (
+        f"background:{palette['accent_soft']};color:{palette['accent']};"
+        "border:none;border-radius:8px;padding:5px 12px;font-size:0.82rem;"
+        "cursor:pointer;margin-right:6px;"
+    )
+    html_code = f"""
+    <div style="font-family:Inter,sans-serif;background:{palette['panel']};
+                border:1px solid {palette['border']};border-radius:10px;
+                padding:10px 14px;color:{palette['text']};box-sizing:border-box;">
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+        <button id="play-{uid}" style="{btn_style}">▶ Listen</button>
+        <button id="pause-{uid}" style="{btn_style}">⏸ Pause</button>
+        <button id="stop-{uid}" style="{btn_style}">⏹ Stop</button>
+        <label style="font-size:0.78rem;color:{palette['muted']};margin-left:6px;">
+          Speed
+          <input id="speed-{uid}" type="range" min="0.5" max="2" step="0.1" value="1"
+                 style="vertical-align:middle;">
+        </label>
+        <span id="speedval-{uid}" style="font-size:0.78rem;color:{palette['muted']};">1.0x</span>
+      </div>
+      <div id="status-{uid}" style="font-size:0.75rem;color:{palette['muted']};margin-top:6px;">Ready.</div>
+    </div>
+    <script>
+    (function() {{
+      const text = {text_json};
+      const targetLang = "{bcp47}";
+      const statusEl = document.getElementById("status-{uid}");
+
+      function pickVoice() {{
+        const voices = window.speechSynthesis.getVoices();
+        if (!voices || voices.length === 0) return null;
+        let v = voices.find(v => v.lang.toLowerCase() === targetLang.toLowerCase());
+        if (!v) v = voices.find(v => v.lang.toLowerCase().startsWith(targetLang.split('-')[0].toLowerCase()));
+        return v || null;
+      }}
+
+      function withVoices(cb) {{
+        const voices = window.speechSynthesis.getVoices();
+        if (voices && voices.length > 0) {{ cb(); return; }}
+        window.speechSynthesis.onvoiceschanged = () => cb();
+      }}
+
+      if (!('speechSynthesis' in window)) {{
+        statusEl.textContent = "Your browser doesn't support text-to-speech.";
+        ["play-{uid}", "pause-{uid}", "stop-{uid}"].forEach(id => {{
+          document.getElementById(id).disabled = true;
+        }});
+        return;
+      }}
+
+      document.getElementById("play-{uid}").onclick = function() {{
+        if (window.speechSynthesis.paused && window.speechSynthesis.speaking) {{
+          window.speechSynthesis.resume();
+          statusEl.textContent = "Speaking…";
+          return;
+        }}
+        withVoices(function() {{
+          const voice = pickVoice();
+          window.speechSynthesis.cancel();
+          const utterance = new SpeechSynthesisUtterance(text);
+          utterance.lang = targetLang;
+          utterance.rate = parseFloat(document.getElementById("speed-{uid}").value);
+          if (voice) {{
+            utterance.voice = voice;
+            statusEl.textContent = "Speaking with " + voice.name + "…";
+          }} else {{
+            statusEl.textContent = "No voice available for this language in your browser — using the default voice instead.";
+          }}
+          utterance.onend = function() {{ statusEl.textContent = "Finished."; }};
+          utterance.onerror = function(e) {{ statusEl.textContent = "Speech error: " + e.error; }};
+          window.speechSynthesis.speak(utterance);
+        }});
+      }};
+
+      document.getElementById("pause-{uid}").onclick = function() {{
+        if (window.speechSynthesis.speaking) {{
+          window.speechSynthesis.pause();
+          statusEl.textContent = "Paused.";
+        }}
+      }};
+
+      document.getElementById("stop-{uid}").onclick = function() {{
+        window.speechSynthesis.cancel();
+        statusEl.textContent = "Stopped.";
+      }};
+
+      document.getElementById("speed-{uid}").oninput = function(e) {{
+        document.getElementById("speedval-{uid}").textContent = parseFloat(e.target.value).toFixed(1) + "x";
+      }};
+    }})();
+    </script>
+    """
+    st.components.v1.html(html_code, height=100)
+
+
+def run_query(question: str, top_k: int, language: str = "auto"):
     entry = {"question": question, "ts": datetime.now().strftime("%H:%M")}
     start = time.perf_counter()
     try:
-        response = requests.post(
-            f"{API_URL}/query",
-            json={"question": question, "top_k": top_k},
-            timeout=120,
-        )
+        with st.spinner("Searching contracts and drafting a grounded answer…"):
+            response = requests.post(
+                f"{API_URL}/query",
+                json={"question": question, "top_k": top_k, "language": language},
+                headers=auth_headers(),
+                timeout=120,
+            )
+        if response.status_code == 401:
+            st.session_state["token"] = None
+            st.session_state["user_email"] = None
+            st.warning("Your session expired. Please log in again.")
+            st.rerun()
         response.raise_for_status()
         result = response.json()
         entry["error"] = None
         entry["answer"] = result.get("answer", "No answer returned.")
         entry["sources"] = result.get("sources", [])
+        entry["detected_language"] = result.get("detected_language")
+        entry["language_error"] = result.get("language_error")
         entry["elapsed"] = time.perf_counter() - start
     except requests.exceptions.ConnectionError:
         entry["error"] = "Could not connect to the FastAPI backend. Make sure it is running at " + API_URL + "."
@@ -106,6 +461,12 @@ def build_transcript_md():
 with st.sidebar:
     st.markdown("## 📄 Groundwork")
     st.caption("Contract Intelligence Console")
+    st.caption(f"Signed in as **{st.session_state['user_email']}**")
+    if st.button("🚪 Log out", use_container_width=True):
+        st.session_state["token"] = None
+        st.session_state["user_email"] = None
+        st.rerun()
+    st.markdown("---")
 
     with st.expander("🎨 Appearance", expanded=True):
         theme_name = st.selectbox("Theme", list(THEMES.keys()),
@@ -114,6 +475,16 @@ with st.sidebar:
                                          value=st.session_state["density_name"])
         st.session_state["theme_name"] = theme_name
         st.session_state["density_name"] = density_name
+
+    with st.expander("🌐 Language", expanded=False):
+        language_label = st.selectbox(
+            "Question & answer language", list(LANGUAGES.keys()), index=0,
+            help="Auto-detect works out the language of each question you type. "
+                 "Picking a language explicitly answers in that language regardless.",
+        )
+        language_code = LANGUAGES[language_label]
+        st.caption("Contracts are English-only — your question is translated to "
+                   "English for retrieval, then the answer is translated back.")
 
     with st.expander("🔍 Retrieval settings", expanded=True):
         top_k = st.slider("Number of sources", min_value=1, max_value=10, value=5,
@@ -134,8 +505,14 @@ with st.sidebar:
                     resp = requests.post(
                         f"{API_URL}/upload",
                         files={"file": (uploaded_file.name, uploaded_file.getvalue())},
+                        headers=auth_headers(),
                         timeout=300,
                     )
+                    if resp.status_code == 401:
+                        st.session_state["token"] = None
+                        st.session_state["user_email"] = None
+                        st.warning("Your session expired. Please log in again.")
+                        st.rerun()
                     resp.raise_for_status()
                     info = resp.json()
                     st.session_state["last_upload"] = uploaded_file.name
@@ -234,8 +611,6 @@ st.markdown(
         border-radius: 14px;
     }}
 
-    .gw-chip-row {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 18px 0; }}
-
     .gw-file-chip {{
         display: inline-block;
         background: {palette['panel2']};
@@ -245,34 +620,6 @@ st.markdown(
         padding: 3px 10px;
         font-size: 0.78rem;
         margin: 3px 4px 0 0;
-    }}
-
-    .gw-card {{
-        background: {palette['panel']};
-        border: 1px solid {palette['border']};
-        border-radius: 12px;
-        padding: {dens['card_pad']};
-        margin-bottom: {dens['gap']};
-        transition: border-color 0.15s ease;
-    }}
-    .gw-card:hover {{ border-color: {palette['accent']}; }}
-    .gw-card-header {{
-        display: flex; justify-content: space-between; align-items: center; gap: 8px;
-    }}
-    .gw-filename {{ font-weight: 600; color: {palette['text']}; font-size: {dens['font_body']}; }}
-    .gw-chip {{
-        background: {palette['accent_soft']};
-        color: {palette['accent']};
-        border-radius: 999px;
-        padding: 2px 10px;
-        font-size: 0.75rem;
-        white-space: nowrap;
-    }}
-    .gw-card-text {{
-        color: {palette['muted']};
-        font-size: {dens['font_body']};
-        margin-top: 6px;
-        line-height: 1.45;
     }}
 
     .gw-stat-row {{ display: flex; gap: 10px; margin: 8px 0 14px 0; flex-wrap: wrap; }}
@@ -297,13 +644,6 @@ st.markdown(
         border-right: 1px solid {palette['border']};
     }}
 
-    .gw-answer {{
-        background: {palette['panel2']};
-        border: 1px solid {palette['border']};
-        border-radius: 12px;
-        padding: 16px 20px;
-        color: {palette['text']};
-    }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -326,13 +666,15 @@ chip_cols = st.columns(len(QUICK_PROMPTS))
 for col, (label, prompt_text) in zip(chip_cols, QUICK_PROMPTS.items()):
     with col:
         if st.button(label, use_container_width=True, key=f"quick_{label}"):
-            run_query(prompt_text, top_k)
+            run_query(prompt_text, top_k, language_code)
             st.rerun()
 
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ---------------- Chat history ----------------
-for entry in st.session_state.history:
+POINTS_SHOWN_BY_DEFAULT = 5
+
+for msg_idx, entry in enumerate(st.session_state.history):
     with st.chat_message("user"):
         st.write(entry["question"])
 
@@ -341,7 +683,28 @@ for entry in st.session_state.history:
             st.error(entry["error"])
             continue
 
-        st.markdown(f'<div class="gw-answer">{entry["answer"]}</div>', unsafe_allow_html=True)
+        if entry.get("language_error"):
+            st.warning(f"🌐 {entry['language_error']}")
+
+        if not entry.get("answer"):
+            # Unsupported language: nothing else to render for this turn.
+            continue
+
+        if entry.get("detected_language") and entry["detected_language"] != "en":
+            detected_name = LANGUAGE_NAMES_BY_CODE.get(entry["detected_language"], entry["detected_language"])
+            st.caption(f"🌐 Detected language: {detected_name}")
+
+        # A plain st.markdown wrapped in a raw <div> would NOT parse markdown
+        # inside it (CommonMark treats content in a raw HTML block as literal) —
+        # a container keeps the bordered look while still rendering the LLM's
+        # bulleted/bolded markdown correctly.
+        with st.container(border=True):
+            st.markdown(entry["answer"])
+
+        answer_lang = entry.get("detected_language") or (language_code if language_code != "auto" else "en")
+        render_listen_widget(f"listen-{msg_idx}", entry["answer"], answer_lang, palette)
+
+        quotes = extract_quotes(entry["answer"])
 
         sources = entry.get("sources", [])
         filtered = [s for s in sources if s["score"] >= score_threshold]
@@ -366,33 +729,136 @@ for entry in st.session_state.history:
             unsafe_allow_html=True,
         )
 
+        st.markdown(
+            "<div style='margin:14px 0 2px 0;font-weight:700;font-size:0.95rem;"
+            f"color:{palette['text']};'>📚 Sources</div>",
+            unsafe_allow_html=True,
+        )
+
         if not sources:
             st.info("No sources returned.")
         elif not filtered:
             st.warning(f"All {len(sources)} source(s) scored below your {score_threshold:.2f} threshold. "
                        "Lower it in the sidebar to see them.")
         else:
+            search_term = st.text_input(
+                "🔎 Search within these sources",
+                key=f"src_search_{msg_idx}",
+                placeholder="e.g. insurance, termination, liability — highlights matches below",
+            ).strip()
+
+            overlap_terms = extract_overlap_terms(entry["question"], entry["answer"])
+
+            # Target language for the optional per-source excerpt translation:
+            # the explicit sidebar choice, or (if "auto") whatever this answer
+            # was actually given in. None/"en" means there's nothing useful to
+            # translate to, so the toggle won't be shown at all.
+            excerpt_target_lang = language_code if language_code != "auto" else entry.get("detected_language")
+
             for i, source in enumerate(filtered, start=1):
-                preview = source["text"][:300]
-                if len(source["text"]) > 300:
-                    preview += "…"
-                st.markdown(
-                    f"""
-                    <div class="gw-card">
-                        <div class="gw-card-header">
-                            <span class="gw-filename">{i}. {source['filename']}</span>
-                            <span class="gw-chip">chunk {source['chunk_index']} · score {source['score']:.3f}</span>
-                        </div>
-                        <div class="gw-card-text">{preview}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                if len(source["text"]) > 300:
-                    with st.expander("Show full excerpt"):
+                points = split_into_points(source["text"])
+                cited_flags = [point_is_cited(p, quotes) for p in points]
+                cited_count = sum(cited_flags)
+                strength_pct = max(0, min(100, round(source["score"] * 100)))
+
+                with st.container(border=True):
+                    head_l, head_r = st.columns([3, 1])
+                    with head_l:
+                        st.markdown(f"**{i}. {source['filename']}**")
+                        cite_note = f" · ✓ {cited_count} point(s) cited in the answer" if cited_count else ""
+                        st.caption(f"chunk {source['chunk_index']}{cite_note}")
+                    with head_r:
+                        st.markdown(
+                            f"""
+                            <div style="text-align:right;font-size:0.78rem;color:{palette['muted']};">score {source['score']:.3f}</div>
+                            <div style="background:{palette['border']};border-radius:999px;height:6px;margin-top:4px;">
+                                <div style="background:{palette['accent']};width:{strength_pct}%;height:6px;border-radius:999px;"></div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                    def render_point(p: str, cited: bool):
+                        # Verbatim text is only ever escaped and marked up for
+                        # display (bold/highlight) — the words themselves are
+                        # never changed, reworded, or reordered.
+                        esc = html.escape(p)
+                        esc = bold_overlap_html(esc, overlap_terms)
+                        esc = highlight_html(esc, search_term, palette["warn"] + "66")
+                        if cited:
+                            st.markdown(
+                                f"<div style='background:{palette['accent_soft']};border-left:3px solid {palette['accent']};"
+                                f"padding:6px 10px;margin:4px 0;border-radius:6px;font-size:0.85rem;color:{palette['text']};'>"
+                                f"✓ <b>cited in answer</b> — {esc}</div>",
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(
+                                f"<div style='padding:4px 10px;margin:2px 0;font-size:0.85rem;color:{palette['muted']};'>• {esc}</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                    shown = points[:POINTS_SHOWN_BY_DEFAULT]
+                    shown_flags = cited_flags[:POINTS_SHOWN_BY_DEFAULT]
+                    for p, cited in zip(shown, shown_flags):
+                        render_point(p, cited)
+
+                    rest = points[POINTS_SHOWN_BY_DEFAULT:]
+                    rest_flags = cited_flags[POINTS_SHOWN_BY_DEFAULT:]
+                    if rest:
+                        with st.expander(f"📖 Show {len(rest)} more point(s)"):
+                            for p, cited in zip(rest, rest_flags):
+                                render_point(p, cited)
+
+                    # Always one click away, separate from the readable points
+                    # above — this is the unedited chunk exactly as retrieved,
+                    # never a rewrite.
+                    with st.expander("Show original text"):
+                        st.caption("Verbatim chunk, exactly as retrieved — no splitting, bolding, or rewording.")
                         st.code(source["text"], language=None, wrap_lines=True)
+
+                        if excerpt_target_lang and excerpt_target_lang != "en":
+                            target_name = LANGUAGE_NAMES_BY_CODE.get(excerpt_target_lang, excerpt_target_lang)
+                            if st.checkbox(
+                                f"🌐 Translate excerpt to {target_name} (machine translation, not legally authoritative)",
+                                key=f"xlate_toggle_{msg_idx}_{i}",
+                            ):
+                                cache_key = f"xlate_text_{msg_idx}_{i}_{excerpt_target_lang}"
+                                if cache_key not in st.session_state:
+                                    try:
+                                        with st.spinner("Translating excerpt…"):
+                                            tr = requests.post(
+                                                f"{API_URL}/translate",
+                                                json={"text": source["text"], "target_language": excerpt_target_lang},
+                                                headers=auth_headers(),
+                                                timeout=60,
+                                            )
+                                        tr.raise_for_status()
+                                        translated = tr.json().get("translated_text", "")
+                                        st.session_state[cache_key] = translated or None
+                                        if not translated:
+                                            st.warning("Translation returned an empty result.")
+                                    except requests.exceptions.ConnectionError:
+                                        st.session_state[cache_key] = None
+                                        st.error("Could not connect to the backend to translate this excerpt.")
+                                    except requests.exceptions.Timeout:
+                                        st.session_state[cache_key] = None
+                                        st.error("Translating this excerpt timed out.")
+                                    except requests.RequestException as e:
+                                        st.session_state[cache_key] = None
+                                        detail = ""
+                                        try:
+                                            detail = tr.json().get("detail", "")
+                                        except Exception:
+                                            pass
+                                        st.error(f"Translation failed: {detail or e}")
+
+                                cached = st.session_state.get(cache_key)
+                                if cached:
+                                    st.markdown(f"🌐 **Machine translation ({target_name}) — not legally authoritative**")
+                                    st.markdown(cached)
 
 # ---------------- Chat input ----------------
 if prompt := st.chat_input("Ask about the indexed contracts…"):
-    run_query(prompt, top_k)
+    run_query(prompt, top_k, language_code)
     st.rerun()

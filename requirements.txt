@@ -33,3 +33,10 @@ psycopg2-binary==2.9.9
 
 # --- Validation ---
 pydantic==2.9.2
+
+# --- Auth ---
+bcrypt==4.2.0
+pyjwt==2.9.0
+
+# --- Language ---
+langdetect==1.0.9

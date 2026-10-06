@@ -1,8 +1,9 @@
 @echo off
 REM Starts Groundwork's backend: Qdrant + Postgres, then the FastAPI server.
-REM Uses port 8001 because port 8000 is often occupied by the FleetMind project
-REM on this machine. If that's no longer the case, change 8001 below (and the
-REM matching value in run_ui.bat) back to 8000.
+REM Uses port 8002: 8000 is often occupied by the FleetMind project on this
+REM machine, and 8001 got stuck held by an unkillable stale process during
+REM development. If neither conflict applies for you, 8000 is fine too --
+REM just change this and the matching value in run_ui.bat.
 
 cd /d "%~dp0"
 
@@ -12,5 +13,5 @@ docker compose up -d
 echo Activating virtual environment...
 call venv\Scripts\activate.bat
 
-echo Starting Groundwork API on http://localhost:8001 ...
-python -m uvicorn main:app --reload --port 8001
+echo Starting Groundwork API on http://localhost:8002 ...
+python -m uvicorn main:app --reload --port 8002

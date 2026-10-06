@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.pyc
+.env
+data/
+.git/
+.gitignore
+.DS_Store
+.vscode/
+eda_results/
+eda_output.txt
+gitlog_full.txt
+Groundwork_Project_Review.pptx
+*.bat
