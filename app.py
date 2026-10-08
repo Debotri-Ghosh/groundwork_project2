@@ -181,14 +181,6 @@ if not st.session_state["token"]:
     st.stop()
 
 
-def confidence_tier(score, palette):
-    if score >= 0.5:
-        return "High confidence", palette["good"]
-    elif score >= 0.3:
-        return "Medium confidence", palette["warn"]
-    return "Low confidence", palette["bad"]
-
-
 # ---------------- Excerpt point-splitting & citation highlighting ----------------
 # Display-only heuristics — never touch the raw grounding text itself, just
 # how it's segmented and annotated in the UI.
@@ -430,6 +422,7 @@ def run_query(question: str, top_k: int, language: str = "auto"):
         entry["sources"] = result.get("sources", [])
         entry["detected_language"] = result.get("detected_language")
         entry["language_error"] = result.get("language_error")
+        entry["evidence"] = result.get("evidence", "None")
         entry["elapsed"] = time.perf_counter() - start
     except requests.exceptions.ConnectionError:
         entry["error"] = "Could not connect to the FastAPI backend. Make sure it is running at " + API_URL + "."
@@ -651,14 +644,32 @@ st.markdown(
 
 # ---------------- Hero header ----------------
 st.markdown(
-    """
+    f"""
     <div class="gw-hero">
         <h1>Groundwork</h1>
-        <p>Ask questions about the indexed contract library — grounded, cited, and traceable.</p>
+        <p>Answers from your contracts, with the evidence attached.</p>
+        <div style="margin-top:8px;">
+            <span class="gw-stat">📚 510 real contracts</span>
+            <span class="gw-stat">🔗 Cited answers</span>
+            <span class="gw-stat">🌐 8 languages</span>
+        </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
+
+with st.expander("❓ Why Groundwork vs. a general chatbot?"):
+    st.markdown(
+        """
+| | A general chatbot | Groundwork |
+|---|---|---|
+| **Source of answers** | The model's own memory | Your indexed contract documents |
+| **Citations** | None, or unverifiable | The exact clause/sentence is shown |
+| **When evidence is missing** | May guess anyway | Says "no strong evidence found" |
+| **Scope** | Whatever was pasted into the chat | All 510 contracts, persistently indexed |
+| **Control** | Black box | Login, swappable LLM, auditable sources |
+        """
+    )
 
 # ---------------- Quick prompts ----------------
 st.caption("Quick prompts")
@@ -690,9 +701,16 @@ for msg_idx, entry in enumerate(st.session_state.history):
             # Unsupported language: nothing else to render for this turn.
             continue
 
-        if entry.get("detected_language") and entry["detected_language"] != "en":
-            detected_name = LANGUAGE_NAMES_BY_CODE.get(entry["detected_language"], entry["detected_language"])
-            st.caption(f"🌐 Detected language: {detected_name}")
+        # Header row for the answer card: detected-language indicator on the
+        # left, Listen/Pause/Stop control on the right.
+        answer_lang = entry.get("detected_language") or (language_code if language_code != "auto" else "en")
+        header_l, header_r = st.columns([3, 2])
+        with header_l:
+            if entry.get("detected_language") and entry["detected_language"] != "en":
+                detected_name = LANGUAGE_NAMES_BY_CODE.get(entry["detected_language"], entry["detected_language"])
+                st.caption(f"🌐 Detected language: {detected_name}")
+        with header_r:
+            render_listen_widget(f"listen-{msg_idx}", entry["answer"], answer_lang, palette)
 
         # A plain st.markdown wrapped in a raw <div> would NOT parse markdown
         # inside it (CommonMark treats content in a raw HTML block as literal) —
@@ -700,9 +718,6 @@ for msg_idx, entry in enumerate(st.session_state.history):
         # bulleted/bolded markdown correctly.
         with st.container(border=True):
             st.markdown(entry["answer"])
-
-        answer_lang = entry.get("detected_language") or (language_code if language_code != "auto" else "en")
-        render_listen_widget(f"listen-{msg_idx}", entry["answer"], answer_lang, palette)
 
         quotes = extract_quotes(entry["answer"])
 
@@ -714,15 +729,28 @@ for msg_idx, entry in enumerate(st.session_state.history):
         elif sort_by == "Chunk order":
             filtered = sorted(filtered, key=lambda s: s["chunk_index"])
 
+        # Group by contract for display: keeps whatever ordering sort_by just
+        # established within each contract, but makes every contract's
+        # chunks adjacent instead of interleaved (e.g. under "Chunk order").
+        _grouped = {}
+        for _s in filtered:
+            _grouped.setdefault(_s["filename"], []).append(_s)
+        filtered = [_s for _group in _grouped.values() for _s in _group]
+
         top_score = max((s["score"] for s in sources), default=0.0)
-        tier_label, tier_color = confidence_tier(top_score, palette)
+        evidence = entry.get("evidence", "None")
+        evidence_colors = {
+            "Strong": palette["good"], "Moderate": palette["warn"],
+            "Weak": palette["bad"], "None": palette["muted"],
+        }
+        tier_color = evidence_colors.get(evidence, palette["muted"])
 
         st.markdown(
             f"""
             <div class="gw-stat-row">
-                <span class="gw-badge" style="background:{tier_color};">{tier_label}</span>
+                <span class="gw-badge" style="background:{tier_color};">{evidence} evidence</span>
                 <span class="gw-stat">⏱ {entry.get('elapsed', 0):.1f}s</span>
-                <span class="gw-stat">📚 {len(sources)} source(s) retrieved</span>
+                <span class="gw-stat">📚 {len(sources)} relevant source(s) found</span>
                 <span class="gw-stat">🎯 top score {top_score:.3f}</span>
             </div>
             """,
@@ -755,7 +783,15 @@ for msg_idx, entry in enumerate(st.session_state.history):
             # translate to, so the toggle won't be shown at all.
             excerpt_target_lang = language_code if language_code != "auto" else entry.get("detected_language")
 
+            _last_filename = None
             for i, source in enumerate(filtered, start=1):
+                if source["filename"] != _last_filename:
+                    _last_filename = source["filename"]
+                    st.markdown(
+                        f"<div style='margin:16px 0 4px 0;font-weight:700;font-size:0.85rem;"
+                        f"color:{palette['accent']};'>📄 {source['filename']}</div>",
+                        unsafe_allow_html=True,
+                    )
                 points = split_into_points(source["text"])
                 cited_flags = [point_is_cited(p, quotes) for p in points]
                 cited_count = sum(cited_flags)
