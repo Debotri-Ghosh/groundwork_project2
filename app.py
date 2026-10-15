@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from difflib import SequenceMatcher
 
+import pandas as pd
 import requests
 import streamlit as st
 
@@ -312,19 +313,20 @@ def render_listen_widget(uid: str, text: str, lang_code: str, palette: dict):
     html_code = f"""
     <div style="font-family:Inter,sans-serif;background:{palette['panel']};
                 border:1px solid {palette['border']};border-radius:10px;
-                padding:10px 14px;color:{palette['text']};box-sizing:border-box;">
-      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                padding:10px 14px;color:{palette['text']};box-sizing:border-box;
+                width:100%;overflow:visible;">
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;row-gap:8px;">
         <button id="play-{uid}" style="{btn_style}">▶ Listen</button>
         <button id="pause-{uid}" style="{btn_style}">⏸ Pause</button>
         <button id="stop-{uid}" style="{btn_style}">⏹ Stop</button>
-        <label style="font-size:0.78rem;color:{palette['muted']};margin-left:6px;">
+        <label style="font-size:0.78rem;color:{palette['muted']};margin-left:6px;white-space:nowrap;">
           Speed
           <input id="speed-{uid}" type="range" min="0.5" max="2" step="0.1" value="1"
                  style="vertical-align:middle;">
         </label>
         <span id="speedval-{uid}" style="font-size:0.78rem;color:{palette['muted']};">1.0x</span>
       </div>
-      <div id="status-{uid}" style="font-size:0.75rem;color:{palette['muted']};margin-top:6px;">Ready.</div>
+      <div id="status-{uid}" style="font-size:0.75rem;color:{palette['muted']};margin-top:8px;">Ready.</div>
     </div>
     <script>
     (function() {{
@@ -396,11 +398,11 @@ def render_listen_widget(uid: str, text: str, lang_code: str, palette: dict):
     }})();
     </script>
     """
-    st.components.v1.html(html_code, height=100)
+    st.components.v1.html(html_code, height=140, scrolling=False)
 
 
 def run_query(question: str, top_k: int, language: str = "auto"):
-    entry = {"question": question, "ts": datetime.now().strftime("%H:%M")}
+    entry = {"question": question, "ts": datetime.now().strftime("%H:%M"), "language": language}
     start = time.perf_counter()
     try:
         with st.spinner("Searching contracts and drafting a grounded answer…"):
@@ -450,26 +452,84 @@ def build_transcript_md():
     return "\n".join(lines)
 
 
+# ---------------- Session stats, suggestions ----------------
+# Suggestions are a fixed pool of common contract questions, minus whatever
+# was already asked — no LLM call, so they cost nothing.
+SUGGESTION_POOL = {
+    "Audit rights": "Does either party have the right to audit the other's records?",
+    "Liability cap": "Is there a cap on liability, and what is the limit?",
+    "Exclusivity": "Are there any exclusivity obligations on either party?",
+    "Assignment": "Can the agreement be assigned to a third party without consent?",
+    "IP ownership": "Who owns the intellectual property created under this agreement?",
+    "Auto-renewal": "Does the agreement renew automatically, and for how long?",
+    "Change of control": "What happens to the agreement if there is a change of control?",
+    "Confidentiality": "What are the confidentiality obligations and how long do they last?",
+    "Warranties": "What warranties does each party provide?",
+    "Indemnification": "What indemnification obligations exist?",
+    "Dispute resolution": "How are disputes resolved, through courts or arbitration?",
+    "Most favored nation": "Is there a most-favored-nation clause?",
+}
+
+
+def next_suggestions(k: int = 4) -> dict:
+    asked = {e["question"].strip().lower() for e in st.session_state.history}
+    asked |= {q.strip().lower() for q in QUICK_PROMPTS.values()}
+    fresh = {l: q for l, q in SUGGESTION_POOL.items() if q.strip().lower() not in asked}
+    return dict(list(fresh.items())[:k])
+
+
+def session_stats() -> dict:
+    hist = st.session_state.history
+    answered = [e for e in hist if not e.get("error") and e.get("answer")]
+    times = [e["elapsed"] for e in answered if e.get("elapsed")]
+    ev = {"Strong": 0, "Moderate": 0, "Weak": 0, "None": 0}
+    contracts, langs, scores = {}, {}, []
+    for e in answered:
+        ev[e.get("evidence", "None")] = ev.get(e.get("evidence", "None"), 0) + 1
+        for s in e.get("sources", []):
+            contracts[s["filename"]] = contracts.get(s["filename"], 0) + 1
+        if e.get("sources"):
+            scores.append(max(s["score"] for s in e["sources"]))
+        lang = e.get("detected_language") or (e.get("language") if e.get("language") not in (None, "auto") else "en")
+        name = LANGUAGE_NAMES_BY_CODE.get(lang, lang)
+        langs[name] = langs.get(name, 0) + 1
+    return dict(
+        asked=len(hist), answered=len(answered),
+        avg_time=(sum(times) / len(times)) if times else 0.0,
+        ev=ev, contracts=contracts, langs=langs, scores=scores,
+    )
+
+
 # ---------------- Sidebar ----------------
 with st.sidebar:
     st.markdown("## 📄 Groundwork")
     st.caption("Contract Intelligence Console")
-    st.caption(f"Signed in as **{st.session_state['user_email']}**")
+    view = st.radio("View", ["💬 Chat", "📊 Dashboard"], horizontal=True, label_visibility="collapsed")
+
+    _email = st.session_state["user_email"] or ""
+    if st.session_state.get("display_name_for") != _email:
+        st.session_state["display_name"] = _email.split("@")[0]
+        st.session_state["display_name_for"] = _email
+    with st.expander("👤 My profile", expanded=False):
+        _initial = (st.session_state["display_name"] or _email or "?")[0].upper()
+        st.markdown(
+            f"<div style='width:52px;height:52px;border-radius:50%;background:#7c5cff;color:#fff;"
+            f"display:flex;align-items:center;justify-content:center;font-size:1.5rem;"
+            f"font-weight:700;margin-bottom:6px;'>{html.escape(_initial)}</div>",
+            unsafe_allow_html=True,
+        )
+        st.text_input("Display name", key="display_name")
+        st.caption(_email)
+        _s = session_stats()
+        st.caption(f"Questions this session: {_s['asked']} · Documents indexed: {len(st.session_state['uploaded_files'])}")
+
     if st.button("🚪 Log out", use_container_width=True):
         st.session_state["token"] = None
         st.session_state["user_email"] = None
         st.rerun()
     st.markdown("---")
 
-    with st.expander("🎨 Appearance", expanded=True):
-        theme_name = st.selectbox("Theme", list(THEMES.keys()),
-                                   index=list(THEMES.keys()).index(st.session_state["theme_name"]))
-        density_name = st.select_slider("Density", options=list(DENSITY.keys()),
-                                         value=st.session_state["density_name"])
-        st.session_state["theme_name"] = theme_name
-        st.session_state["density_name"] = density_name
-
-    with st.expander("🌐 Language", expanded=False):
+    with st.expander("🌐 Language", expanded=True):
         language_label = st.selectbox(
             "Question & answer language", list(LANGUAGES.keys()), index=0,
             help="Auto-detect works out the language of each question you type. "
@@ -478,6 +538,14 @@ with st.sidebar:
         language_code = LANGUAGES[language_label]
         st.caption("Contracts are English-only — your question is translated to "
                    "English for retrieval, then the answer is translated back.")
+
+    with st.expander("🎨 Appearance", expanded=False):
+        theme_name = st.selectbox("Theme", list(THEMES.keys()),
+                                   index=list(THEMES.keys()).index(st.session_state["theme_name"]))
+        density_name = st.select_slider("Density", options=list(DENSITY.keys()),
+                                         value=st.session_state["density_name"])
+        st.session_state["theme_name"] = theme_name
+        st.session_state["density_name"] = density_name
 
     with st.expander("🔍 Retrieval settings", expanded=True):
         top_k = st.slider("Number of sources", min_value=1, max_value=10, value=5,
@@ -658,18 +726,35 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.expander("❓ Why Groundwork vs. a general chatbot?"):
-    st.markdown(
-        """
-| | A general chatbot | Groundwork |
-|---|---|---|
-| **Source of answers** | The model's own memory | Your indexed contract documents |
-| **Citations** | None, or unverifiable | The exact clause/sentence is shown |
-| **When evidence is missing** | May guess anyway | Says "no strong evidence found" |
-| **Scope** | Whatever was pasted into the chat | All 510 contracts, persistently indexed |
-| **Control** | Black box | Login, swappable LLM, auditable sources |
-        """
-    )
+# ---------------- Dashboard view ----------------
+if view == "📊 Dashboard":
+    stt = session_stats()
+    st.subheader(f"📊 Dashboard — {st.session_state['display_name']}")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Questions answered", stt["answered"])
+    m2.metric("Avg response time", f"{stt['avg_time']:.1f}s")
+    m3.metric("Documents uploaded", len(st.session_state["uploaded_files"]))
+    m4.metric("Languages used", len(stt["langs"]))
+
+    if not stt["answered"]:
+        st.info("Ask a few questions in the Chat view — your charts will appear here.")
+        st.stop()
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Evidence strength of answers**")
+        st.bar_chart(pd.DataFrame({"answers": list(stt["ev"].values())}, index=list(stt["ev"].keys())))
+    with right:
+        st.markdown("**Top relevance score per question**")
+        st.line_chart(pd.DataFrame({"score": stt["scores"]}))
+
+    st.markdown("**Most-cited contracts**")
+    top = sorted(stt["contracts"].items(), key=lambda kv: kv[1], reverse=True)[:5]
+    st.dataframe(pd.DataFrame(top, columns=["Contract", "Times cited"]), use_container_width=True, hide_index=True)
+    st.markdown("**Languages**")
+    st.dataframe(pd.DataFrame(list(stt["langs"].items()), columns=["Language", "Questions"]),
+                 use_container_width=True, hide_index=True)
+    st.stop()
 
 # ---------------- Quick prompts ----------------
 st.caption("Quick prompts")
@@ -679,6 +764,15 @@ for col, (label, prompt_text) in zip(chip_cols, QUICK_PROMPTS.items()):
         if st.button(label, use_container_width=True, key=f"quick_{label}"):
             run_query(prompt_text, top_k, language_code)
             st.rerun()
+
+_sugg = next_suggestions(4)
+if _sugg:
+    st.caption("💡 Suggested for you")
+    for col, (label, q) in zip(st.columns(len(_sugg)), _sugg.items()):
+        with col:
+            if st.button(label, use_container_width=True, key=f"sugg_{label}", help=q):
+                run_query(q, top_k, language_code)
+                st.rerun()
 
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -701,16 +795,15 @@ for msg_idx, entry in enumerate(st.session_state.history):
             # Unsupported language: nothing else to render for this turn.
             continue
 
-        # Header row for the answer card: detected-language indicator on the
-        # left, Listen/Pause/Stop control on the right.
+        # Header row for the answer card: detected-language indicator above
+        # the Listen/Pause/Stop control. Full width, not squeezed into a
+        # narrow column — the widget wraps onto 2-3 lines and was getting
+        # clipped by a fixed-height iframe in a narrow column before.
         answer_lang = entry.get("detected_language") or (language_code if language_code != "auto" else "en")
-        header_l, header_r = st.columns([3, 2])
-        with header_l:
-            if entry.get("detected_language") and entry["detected_language"] != "en":
-                detected_name = LANGUAGE_NAMES_BY_CODE.get(entry["detected_language"], entry["detected_language"])
-                st.caption(f"🌐 Detected language: {detected_name}")
-        with header_r:
-            render_listen_widget(f"listen-{msg_idx}", entry["answer"], answer_lang, palette)
+        if entry.get("detected_language") and entry["detected_language"] != "en":
+            detected_name = LANGUAGE_NAMES_BY_CODE.get(entry["detected_language"], entry["detected_language"])
+            st.caption(f"🌐 Detected language: {detected_name}")
+        render_listen_widget(f"listen-{msg_idx}", entry["answer"], answer_lang, palette)
 
         # A plain st.markdown wrapped in a raw <div> would NOT parse markdown
         # inside it (CommonMark treats content in a raw HTML block as literal) —

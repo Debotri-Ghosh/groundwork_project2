@@ -162,25 +162,39 @@ def build_prompt(question: str, chunks) -> str:
     )
 
 
-def _llm_chat(prompt: str) -> str:
-    """Single place that actually calls the configured LLM — used for both
-    answer generation and translation, so provider-branching lives once."""
-    if llm_client is None:
-        return "(No LLM configured — set LLM_PROVIDER in .env to 'openai' or 'ollama')"
-
+def _llm_chat_once(prompt: str) -> str:
     if LLM_PROVIDER == "openai":
         response = llm_client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response.choices[0].message.content
+        return response.choices[0].message.content or ""
 
     elif LLM_PROVIDER == "ollama":
         response = llm_client.chat(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response["message"]["content"]
+        return response["message"]["content"] or ""
+
+    return ""
+
+
+def _llm_chat(prompt: str) -> str:
+    """Single place that actually calls the configured LLM — used for both
+    answer generation and translation, so provider-branching lives once.
+    Retries once on an empty completion: observed intermittently (roughly
+    1 in 4 calls during testing) from this Groq-hosted model, unrelated to
+    prompt content — a second attempt reliably succeeds."""
+    if llm_client is None:
+        return "(No LLM configured — set LLM_PROVIDER in .env to 'openai' or 'ollama')"
+    if LLM_PROVIDER not in ("openai", "ollama"):
+        return "(Unsupported LLM_PROVIDER)"
+
+    content = _llm_chat_once(prompt)
+    if not content.strip():
+        content = _llm_chat_once(prompt)
+    return content
 
     return "(Unsupported LLM_PROVIDER)"
 
