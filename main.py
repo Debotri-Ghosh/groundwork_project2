@@ -31,6 +31,16 @@ COLLECTION_NAME = "groundwork_chunks"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
 TOP_K = 5
 
+# Relevance filtering (Phase 1). Calibrated against four real questions —
+# see PROJECT_DOCUMENTATION.md for the observed score clusters:
+#   insurance requirements  -> top 0.705 (clearly relevant)
+#   non-compete duration    -> top 0.463 (relevant, weaker)
+#   EOT for delayed work    -> top 0.576 (relevant)
+#   "capital of France"     -> top 0.262 (irrelevant control)
+# 0.35 sits in the ~0.09 gap between the irrelevant and relevant clusters.
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.35"))
+RELATIVE_SCORE_RATIO = 0.70  # keep only chunks within 70% of the top score
+
 # ISO 639-1 code -> display name. Contracts and the embedding model are
 # English-only, so every non-English question is translated to English
 # before retrieval, and the answer translated back before it's returned.
@@ -87,6 +97,7 @@ class QueryResponse(BaseModel):
     sources: list[Source]
     detected_language: Optional[str] = None
     language_error: Optional[str] = None
+    evidence: str = "None"  # "Strong" | "Moderate" | "Weak" | "None"
 
 
 class TranslateRequest(BaseModel):
@@ -106,6 +117,28 @@ def retrieve(question: str, top_k: int):
         limit=top_k,
     ).points
     return results
+
+
+def filter_relevant_chunks(chunks):
+    """The top-k slider is a maximum, not a guarantee — drop chunks that
+    don't clear an absolute floor (MIN_SCORE) or a relative floor (70% of
+    the top score among this candidate set). Never backfills from outside
+    the original top-k candidates; only ever narrows them."""
+    if not chunks:
+        return []
+    top_score = chunks[0].score
+    relative_floor = RELATIVE_SCORE_RATIO * top_score
+    return [c for c in chunks if c.score >= MIN_SCORE and c.score >= relative_floor]
+
+
+def evidence_label(top_score: float) -> str:
+    if top_score >= 0.55:
+        return "Strong"
+    if top_score >= 0.45:
+        return "Moderate"
+    if top_score >= MIN_SCORE:
+        return "Weak"
+    return "None"
 
 
 def build_prompt(question: str, chunks) -> str:
@@ -129,25 +162,39 @@ def build_prompt(question: str, chunks) -> str:
     )
 
 
-def _llm_chat(prompt: str) -> str:
-    """Single place that actually calls the configured LLM — used for both
-    answer generation and translation, so provider-branching lives once."""
-    if llm_client is None:
-        return "(No LLM configured — set LLM_PROVIDER in .env to 'openai' or 'ollama')"
-
+def _llm_chat_once(prompt: str) -> str:
     if LLM_PROVIDER == "openai":
         response = llm_client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response.choices[0].message.content
+        return response.choices[0].message.content or ""
 
     elif LLM_PROVIDER == "ollama":
         response = llm_client.chat(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response["message"]["content"]
+        return response["message"]["content"] or ""
+
+    return ""
+
+
+def _llm_chat(prompt: str) -> str:
+    """Single place that actually calls the configured LLM — used for both
+    answer generation and translation, so provider-branching lives once.
+    Retries once on an empty completion: observed intermittently (roughly
+    1 in 4 calls during testing) from this Groq-hosted model, unrelated to
+    prompt content — a second attempt reliably succeeds."""
+    if llm_client is None:
+        return "(No LLM configured — set LLM_PROVIDER in .env to 'openai' or 'ollama')"
+    if LLM_PROVIDER not in ("openai", "ollama"):
+        return "(Unsupported LLM_PROVIDER)"
+
+    content = _llm_chat_once(prompt)
+    if not content.strip():
+        content = _llm_chat_once(prompt)
+    return content
 
     return "(Unsupported LLM_PROVIDER)"
 
@@ -212,9 +259,26 @@ def query(request: QueryRequest, current_user: User = Depends(get_current_user))
         except Exception as e:
             language_error = f"Translating your question failed ({e}); answering using your original text."
 
-    # ---- Unchanged core: retrieve + generate, strictly from English excerpts ----
+    # ---- Retrieve (top_k is a maximum candidate set), then filter for relevance ----
     chunks = retrieve(english_question, request.top_k)
-    answer = generate_answer(english_question, chunks)
+    relevant = filter_relevant_chunks(chunks)
+    top_score = chunks[0].score if chunks else 0.0
+    evidence = evidence_label(top_score if relevant else 0.0)
+
+    if not relevant:
+        # Nothing cleared the relevance bar -- don't spend an LLM call on it.
+        return QueryResponse(
+            answer="No strong evidence found in the contracts.",
+            sources=[], detected_language=detected, language_error=language_error,
+            evidence="None",
+        )
+
+    # Group passages by contract: stable sort by filename, then chunk order,
+    # so same-contract chunks are adjacent for the frontend to render under
+    # one heading.
+    relevant = sorted(relevant, key=lambda c: (c.payload["filename"], c.payload["chunk_index"]))
+
+    answer = generate_answer(english_question, relevant)
 
     # ---- Answer -> user's language ----
     if effective_lang != "en":
@@ -236,9 +300,12 @@ def query(request: QueryRequest, current_user: User = Depends(get_current_user))
             score=c.score,
             text=c.payload["text"],
         )
-        for c in chunks
+        for c in relevant
     ]
-    return QueryResponse(answer=answer, sources=sources, detected_language=detected, language_error=language_error)
+    return QueryResponse(
+        answer=answer, sources=sources, detected_language=detected,
+        language_error=language_error, evidence=evidence,
+    )
 
 
 @app.post("/translate", response_model=TranslateResponse)
